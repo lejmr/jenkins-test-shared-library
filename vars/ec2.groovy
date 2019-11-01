@@ -65,7 +65,8 @@ String register(String serverId, String sshCredentials, String awsRegion, String
                 "jenkins",
                 "${numExecutors}",
                 Node.Mode.NORMAL,
-                "${agent_name} ${env.BUILD_TAG}",
+                // TODO: remove the first two labels as they are no longer necessary.. they are reguired by legacy pipelines
+                "${agent_name} ${instance.InstanceId} ${env.BUILD_TAG}",
                 new SSHLauncher(instance.PrivateIpAddress, 22, sshCredentials,
                 ,"","","","",0,0,0,null),
                 new RetentionStrategy.Always(),
@@ -93,6 +94,55 @@ String register(String serverId, String sshCredentials, String awsRegion, String
 
 
 // Function for deregistering Job from Jenkins. If no other jobs are present EC2 can be stopped
-def deregister(String agentLabel, String awsCredentials, Boolean stopEc2 = true){
+def deregister(String agent_name, String awsRegion, String awsCredentials, Boolean stopEc2 = true){
+    String lock_name = "agent-${agent_name}".toLowerCase()
+    lock(resource: lock_name){
+      // Magic..
+      def agentLabels = ["do", "nothing"]
 
+      // Remove tag
+      if(Jenkins.instance.getNode(agent_name)){
+        // If there is an Jenkins agent of name agent_name .. remove tag. Otherwise do nothing
+        echo "Removing BUILD_TAG ($env.BUILD_TAG) from ${agent_name}"
+        agentLabels = Jenkins.instance.getNode(agent_name).getLabelString().split(' ')
+        agentLabels -= [env.BUILD_TAG]
+        Jenkins.instance.getNode(agent_name).setLabelString(agentLabels.join(' '))
+      }
+
+      // Stop EC2 instance if possible
+      if(stopEc2 && agentLabels.length <= 2){
+        // Find EC2 instance ID based on IP address of agent
+        def local_ip = Jenkins.instance.getNode(agent_name).getLauncher().getHost()
+
+        node("master"){
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: awsCredentials]]){
+            // Describe server by private IP
+            def result = sh returnStdout: true,
+            script: "aws ec2 describe-instances  --region ${awsRegion} --filters 'Name=network-interface.addresses.private-ip-address,Values=${local_ip}'"
+            def metadata = readJSON(text: result.toString())
+
+            // Process the EC2 instance describe JSON response
+            for(instances in metadata.Reservations){
+              for(instance in instances.Instances){
+                echo "Discovered EC2 instance ${instance.InstanceId}(${instance.PrivateIpAddress}) to be stopped"
+
+                // Remove Jenkins agent
+                Jenkins.instance.removeNode(Jenkins.instance.getNode(agent_name))
+
+                // Stop running/pending EC2 instance
+                if(instance.State.Code <= 16){
+                  // TODO validate jenkins_resource = true tag is set 
+                  echo "EC2 instance ${instance.InstanceId} is not in 'running' state, but ${instance.State.Name} waiting for 'stopped' state"
+                  sh "aws ec2 wait instance-running --region ${awsRegion} --instance-ids ${instance.InstanceId}"
+                  sh "aws ec2 stop-instances --region ${awsRegion} --instance-ids ${instance.InstanceId}"
+                }
+
+                // Stop only one server
+                break
+              }
+            }
+          }
+        }
+      }
+    }
 }
